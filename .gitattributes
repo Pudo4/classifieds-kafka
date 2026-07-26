@@ -1,0 +1,7 @@
+# Force LF everywhere, regardless of a contributor's core.autocrlf on
+# Windows. Shell scripts under docker/ are copied straight into Linux
+# containers (see Dockerfile/docker-compose.yml) -- CRLF in a `#!/bin/sh`
+# script breaks the shebang at container startup, and this was confirmed
+# to be a real risk on this project, not a hypothetical one.
+* text=auto eol=lf
+*.sh text eol=lf

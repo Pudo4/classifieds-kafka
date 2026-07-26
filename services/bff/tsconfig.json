@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "lib": ["ES2022", "DOM", "DOM.AsyncIterable"]
+  },
+  "include": ["src"],
+  "references": [{ "path": "../../packages/platform" }]
+}

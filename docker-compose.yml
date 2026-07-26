@@ -1,0 +1,368 @@
+name: classifieds-kafka
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: classifieds-kafka
+    ports:
+      - "${KAFKA_HOST_PORT:-9092}:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,DOCKER://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,DOCKER://kafka:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,DOCKER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # The image's actual default log.dirs is /tmp/kafka-logs, not
+      # /var/lib/kafka/data -- without this override the volume below mounts
+      # an unused directory and every container recreation silently wipes
+      # all topics. Confirmed the hard way (see README phase 2 notes).
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Single broker, replication factor 1 everywhere -- see README "Честность про инфраструктуру".
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_NUM_PARTITIONS: 3
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  # One-shot: creates every topic with its documented partition count and
+  # retention/compaction settings, then exits 0. `docker compose up -d`
+  # returns before this necessarily finishes -- check `docker compose ps`
+  # (or just `docker compose logs kafka-topics-init`) for a clean exit
+  # before starting services that produce/consume on a fresh topic.
+  kafka-topics-init:
+    image: apache/kafka:3.9.0
+    container_name: classifieds-kafka-topics-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/create-topics.sh"]
+    volumes:
+      - ./docker/kafka/create-topics.sh:/create-topics.sh:ro
+    restart: "no"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: classifieds-postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+      LISTING_DB_NAME: ${LISTING_DB_NAME:-listings_db}
+      LISTING_DB_USER: ${LISTING_DB_USER:-listing_svc}
+      LISTING_DB_PASSWORD: ${LISTING_DB_PASSWORD:-listing_pw}
+      MEDIA_DB_NAME: ${MEDIA_DB_NAME:-media_db}
+      MEDIA_DB_USER: ${MEDIA_DB_USER:-media_svc}
+      MEDIA_DB_PASSWORD: ${MEDIA_DB_PASSWORD:-media_pw}
+      ENGAGEMENT_DB_NAME: ${ENGAGEMENT_DB_NAME:-engagement_db}
+      ENGAGEMENT_DB_USER: ${ENGAGEMENT_DB_USER:-engagement_svc}
+      ENGAGEMENT_DB_PASSWORD: ${ENGAGEMENT_DB_PASSWORD:-engagement_pw}
+      MODERATION_DB_NAME: ${MODERATION_DB_NAME:-moderation_db}
+      MODERATION_DB_USER: ${MODERATION_DB_USER:-moderation_svc}
+      MODERATION_DB_PASSWORD: ${MODERATION_DB_PASSWORD:-moderation_pw}
+      NOTIFICATION_DB_NAME: ${NOTIFICATION_DB_NAME:-notifications_db}
+      NOTIFICATION_DB_USER: ${NOTIFICATION_DB_USER:-notification_svc}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:-notification_pw}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-postgres} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-multi-db.sh:/docker-entrypoint-initdb.d/init-multi-db.sh:ro
+
+  redis:
+    image: redis:7-alpine
+    container_name: classifieds-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - redis-data:/data
+
+  minio:
+    image: minio/minio:latest
+    container_name: classifieds-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - minio-data:/data
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.11
+    container_name: classifieds-meilisearch
+    ports:
+      - "${MEILI_PORT:-7700}:7700"
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-local_dev_master_key_change_me}
+      MEILI_NO_ANALYTICS: "true"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:7700/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - meili-data:/meili_data
+
+  # --- Application services -------------------------------------------
+  # All seven share `Dockerfile` at repo root (selected via build arg
+  # `SERVICE`) and `docker/app/entrypoint.sh` (migrate-then-start). Internal
+  # ports below are each service's own hardcoded default (see
+  # services/*/src/infrastructure/config.ts) and never need to change --
+  # only the host-side publish port is configurable, via *_HOST_PORT in
+  # `.env`. Kafka brokers point at the `DOCKER` listener (`kafka:9094`), not
+  # the `PLAINTEXT` one (`localhost:9092`) that host-run `npm run dev`
+  # processes use -- see `kafka`'s listener config above and
+  # `docker/kafka/create-topics.sh`, which uses the same listener.
+
+  listing:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: listing
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      LISTING_DB_NAME: ${LISTING_DB_NAME:-listings_db}
+      LISTING_DB_USER: ${LISTING_DB_USER:-listing_svc}
+      LISTING_DB_PASSWORD: ${LISTING_DB_PASSWORD:-listing_pw}
+      KAFKA_BROKERS: kafka:9094
+    ports:
+      - "${LISTING_HOST_PORT:-3001}:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-topics-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  moderation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: moderation
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      MODERATION_DB_NAME: ${MODERATION_DB_NAME:-moderation_db}
+      MODERATION_DB_USER: ${MODERATION_DB_USER:-moderation_svc}
+      MODERATION_DB_PASSWORD: ${MODERATION_DB_PASSWORD:-moderation_pw}
+      KAFKA_BROKERS: kafka:9094
+    ports:
+      - "${MODERATION_HOST_PORT:-3003}:3003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-topics-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3003/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  media:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: media
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      MEDIA_DB_NAME: ${MEDIA_DB_NAME:-media_db}
+      MEDIA_DB_USER: ${MEDIA_DB_USER:-media_svc}
+      MEDIA_DB_PASSWORD: ${MEDIA_DB_PASSWORD:-media_pw}
+      KAFKA_BROKERS: kafka:9094
+      MINIO_HOST: minio
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MEDIA_HOST_PORT:-3004}:3004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-topics-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3004/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  engagement:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: engagement
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      ENGAGEMENT_DB_NAME: ${ENGAGEMENT_DB_NAME:-engagement_db}
+      ENGAGEMENT_DB_USER: ${ENGAGEMENT_DB_USER:-engagement_svc}
+      ENGAGEMENT_DB_PASSWORD: ${ENGAGEMENT_DB_PASSWORD:-engagement_pw}
+      KAFKA_BROKERS: kafka:9094
+      REDIS_HOST: redis
+    ports:
+      - "${ENGAGEMENT_HOST_PORT:-3005}:3005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-topics-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3005/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  notification:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: notification
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      NOTIFICATION_DB_NAME: ${NOTIFICATION_DB_NAME:-notifications_db}
+      NOTIFICATION_DB_USER: ${NOTIFICATION_DB_USER:-notification_svc}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:-notification_pw}
+      KAFKA_BROKERS: kafka:9094
+    ports:
+      - "${NOTIFICATION_HOST_PORT:-3006}:3006"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-topics-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3006/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  search:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: search
+    environment:
+      KAFKA_BROKERS: kafka:9094
+      MEILI_HOST: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-local_dev_master_key_change_me}
+    ports:
+      - "${SEARCH_HOST_PORT:-3002}:3002"
+    depends_on:
+      kafka-topics-init:
+        condition: service_completed_successfully
+      meilisearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3002/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  bff:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: bff
+    environment:
+      LISTING_SERVICE_URL: http://listing:3001
+      SEARCH_SERVICE_URL: http://search:3002
+      MEDIA_SERVICE_URL: http://media:3004
+      ENGAGEMENT_SERVICE_URL: http://engagement:3005
+      NOTIFICATION_SERVICE_URL: http://notification:3006
+    ports:
+      - "${BFF_HOST_PORT:-3000}:3000"
+    depends_on:
+      listing:
+        condition: service_healthy
+      search:
+        condition: service_healthy
+      media:
+        condition: service_healthy
+      engagement:
+        condition: service_healthy
+      notification:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    environment:
+      # Host-reachable, not `http://bff:3000` -- this URL is used by
+      # frontend JS running in the browser on the host, not by anything
+      # inside the Docker network.
+      VITE_BFF_URL: http://localhost:${BFF_HOST_PORT:-3000}
+    ports:
+      - "${WEB_HOST_PORT:-5173}:5173"
+    depends_on:
+      bff:
+        condition: service_healthy
+
+volumes:
+  kafka-data:
+  postgres-data:
+  redis-data:
+  minio-data:
+  meili-data:
